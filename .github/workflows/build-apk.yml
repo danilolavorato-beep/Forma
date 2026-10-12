@@ -1,0 +1,107 @@
+name: Build APK
+
+# Il repository contiene solo questo file e forma-sorgenti.zip.
+# A ogni caricamento di uno dei due, il workflow apre lo zip, esegue i test,
+# compila l'APK e lo pubblica tra le Release.
+on:
+  push:
+    branches: [main]
+    paths: ['forma-sorgenti.zip', '.github/workflows/build-apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_OWN_KEY: ${{ secrets.FORMA_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Scarica il repository
+        uses: actions/checkout@v7
+
+      - name: Apri lo zip dei sorgenti
+        run: |
+          unzip -q forma-sorgenti.zip -d app
+          # se lo zip contiene una sola cartella, usa quella
+          if [ ! -f app/package.json ]; then
+            d=$(find app -maxdepth 2 -name package.json -not -path '*/node_modules/*' | head -1 | xargs dirname)
+            mv "$d" app-src && rm -rf app && mv app-src app
+          fi
+          ls -la app
+
+      - name: Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Installa le dipendenze
+        working-directory: app
+        run: npm ci
+
+      - name: Controlla il programma (test)
+        working-directory: app
+        run: npm test
+
+      - name: Chiave di firma personale (facoltativa, dai Secrets)
+        if: env.HAS_OWN_KEY == 'true'
+        run: |
+          echo "${{ secrets.FORMA_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/forma.p12"
+          {
+            echo "FORMA_KEYSTORE=$RUNNER_TEMP/forma.p12"
+            echo "FORMA_KEYSTORE_PASSWORD=${{ secrets.FORMA_KEYSTORE_PASSWORD }}"
+            echo "FORMA_KEY_ALIAS=${{ secrets.FORMA_KEY_ALIAS }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Crea il progetto Android
+        working-directory: app
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          npx cap add android
+          node scripts/prepare-android.mjs
+          npx cap sync android
+
+      - name: Compila l'APK
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Prepara il file
+        run: |
+          mkdir -p dist
+          cp app/android/app/build/outputs/apk/release/app-release.apk "dist/Forma-${{ github.run_number }}.apk"
+          ls -la dist
+
+      - name: Salva l'APK tra gli artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Forma-${{ github.run_number }}
+          path: dist/*.apk
+          retention-days: 30
+
+      - name: Pubblica una release scaricabile dal telefono
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" dist/*.apk \
+            --target "${{ github.sha }}" \
+            --title "Forma, build ${{ github.run_number }}" \
+            --notes "APK generato dal commit ${{ github.sha }}. Dal telefono tocca il file Forma-${{ github.run_number }}.apk per scaricarlo e installarlo." \
+            --latest
